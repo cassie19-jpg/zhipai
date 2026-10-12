@@ -232,6 +232,15 @@ async function loadOrigAudio() {
 
 // ---------- 2. 选人 / 预览 ----------
 const view = $('view'), vctx = view.getContext('2d');
+// 明确设定画布显示尺寸（等比），保证点击坐标和画面像素一一对应
+function fitView() {
+  const maxW = view.parentElement.clientWidth || 360, maxH = window.innerHeight * 0.62;
+  const k = Math.min(maxW / view.width, maxH / view.height);
+  const w = Math.round(view.width * k) + 'px', h = Math.round(view.height * k) + 'px';
+  if (view.style.width !== w) view.style.width = w;
+  if (view.style.height !== h) view.style.height = h;
+}
+window.addEventListener('resize', () => S.samples.length && fitView());
 function sampleAt(t) { // 轨道时间 -> 最近 sample 下标
   const s = S.samples; if (!s.length) return 0;
   let lo = 0, hi = s.length - 1;
@@ -276,13 +285,15 @@ function drawFrame(videoEl, thumb) {
   if (S.view === 'crop' && S.track) {
     const c = cropAt(t);
     const VW = 360, VH = 640;
-    if (view.width !== VW) { view.width = VW; view.height = VH; }
+    if (view.width !== VW || view.height !== VH) { view.width = VW; view.height = VH; }
+    fitView();
     vctx.drawImage(src, c.x * k, c.y * k, c.w * k, c.h * k, 0, 0, VW, VH);
     $('viewtip').textContent = '直拍预览';
     return;
   }
   const VW = Math.min(720, S.W), VH = Math.round(VW * S.H / S.W);
   if (view.width !== VW || view.height !== VH) { view.width = VW; view.height = VH; }
+  fitView();
   vctx.drawImage(src, 0, 0, srcW, srcH, 0, 0, VW, VH);
   const s = VW / S.W;
   const sel = S.track ? S.track[i] : null;
@@ -335,6 +346,17 @@ function updateAnchorsUI() {
   const n = S.anchors.size;
   $('anchors').textContent = n ? `已点选 ${n} 次` + (S.track ? `，跟拍覆盖 ${Math.round(100 * S.track.filter(x => x.det >= 0).length / S.track.length)}% 的画面` : '') : '还没选人';
   $('undo').hidden = !n;
+  const W = $('warns'); W.innerHTML = '';
+  if (S.track && S.track.warnings && S.track.warnings.length) {
+    const lab = document.createElement('div'); lab.className = 'hint'; lab.style.width = '100%'; lab.style.margin = '0';
+    lab.textContent = '这些时刻可能有问题，点一下跳过去看看，跟错了就再点一次你自己：'; W.appendChild(lab);
+    for (const w of S.track.warnings.slice(0, 12)) {
+      const b = document.createElement('button'); b.className = 'w ' + w.kind;
+      b.textContent = (w.kind === 'lost' ? '没找到你 ' : '⚠️ 旁边有很像的人 ') + (w.t0 - S.t0).toFixed(1) + 's';
+      b.onclick = () => { stopPlay(); if (S.view !== 'full') document.querySelector('#viewmode [data-v=full]').click(); seekTo(w.i); };
+      W.appendChild(b);
+    }
+  }
   $('export').disabled = !S.track;
 }
 document.querySelectorAll('#viewmode button').forEach(b => b.addEventListener('click', () => {

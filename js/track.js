@@ -78,15 +78,18 @@ export function solveTrack(samples, anchors, opts = {}) {
   if (!anchors.size) return null;
   const keys = [...anchors.keys()].sort((a, b) => a - b);
   const fps = n > 1 ? (n - 1) / Math.max(1e-6, samples[n - 1].t - samples[0].t) : 8;
-  const K = Math.max(2, Math.round((opts.maxGapSec ?? 3) * fps));
-  const SKIP = opts.skip ?? 0.5, W_POS = opts.wPos ?? 4, W_SIZE = opts.wSize ?? 1.0, W_APP = opts.wApp ?? 4, VMAX = opts.vmax ?? 1.2, APP_DB = opts.appDb ?? 0.1, W_JUMP = opts.wJump ?? 30;
+  const K = Math.max(2, Math.round((opts.maxGapSec ?? 10) * fps)); // 最长允许“看不见她”10 秒，期间原地/插值等待，而不是被迫换人
+  const SKIP = opts.skip ?? 0.4, W_STEAL = opts.wSteal ?? 8, W_ACC = opts.wAcc ?? 0.6, W_POS = opts.wPos ?? 4, W_SIZE = opts.wSize ?? 1.0, W_APP = opts.wApp ?? 4, VMAX = opts.vmax ?? 1.2, APP_DB = opts.appDb ?? 0.1, W_JUMP = opts.wJump ?? 30, W_ABS = opts.wAbs ?? 6, ABS_TH = opts.absTh ?? 0.72, MAX_COAST = opts.maxCoast ?? 1.5;
   // 参考外观：所有锚点外观的平均
   let ref = null;
   for (const a of keys) { const h = samples[a].dets[anchors.get(a)].hist; if (!h) continue; if (!ref) ref = new Float32Array(h.length); for (let i = 0; i < h.length; i++) ref[i] += h[i] / keys.length; }
   // 每帧允许的节点
   const allowed = samples.map((s, i) => anchors.has(i) ? [anchors.get(i)] : s.dets.map((_, j) => j));
   // 外观代价取相对值：每帧里最像的那个人代价为 0（避免为了少付外观代价而故意跳帧）
-  const unary = samples.map(s => { const sims = s.dets.map(d => histSim(ref, d.hist)); const mx = Math.max(0, ...sims); return sims.map(v => W_APP * Math.max(0, mx - v - APP_DB)); });
+  const unary = samples.map(s => { const sims = s.dets.map(d => histSim(ref, d.hist)); const mx = Math.max(0, ...sims); return sims.map(v => W_APP * Math.max(0, mx - v - APP_DB) + W_ABS * Math.max(0, ABS_TH - v)); }); // 相对 + 绝对：画面里没有她时，最像的那个人也要付代价（身份锁定）
+  // “接管”检测：如果前一帧就有一个人站在这个框的位置，说明这是另一个一直可见的人，
+  // 跟丢她之后不能直接接到这个人身上（镜子倒影、旁边的人、拍摄者都是这种情况）
+  const occupied = samples.map((s, i) => s.dets.map(d => i > 0 && samples[i - 1].dets.some(e => Math.hypot(cx(e.box) - cx(d.box), cy(e.box) - cy(d.box)) < 0.35 * bh(d.box) && Math.abs(Math.log(bh(e.box) / bh(d.box))) < 0.35)));
   const best = samples.map(s => new Float64Array(s.dets.length).fill(Infinity));
   const back = samples.map(s => new Int32Array(s.dets.length * 2).fill(-1));
   // 下一个锚点（不可跨越）
@@ -107,8 +110,19 @@ export function solveTrack(samples, anchors, opts = {}) {
           const e = dp[q], he = bh(e.box), hm = (h + he) / 2;
           const dist = Math.hypot(c[0] - cx(e.box), c[1] - cy(e.box)) / hm;
           const speed = dist * fps / k; // 每秒移动几个身高
-          const cost = base + W_POS * dist * dist / k + (speed > VMAX ? W_JUMP * (dist - VMAX * k / fps) : 0) + W_SIZE * Math.abs(Math.log(h / he)) + SKIP * (k - 1);
-          if (cost < bv) { bv = cost; bi = p; bj = q; }
+          const allow = Math.min(VMAX * k / fps, MAX_COAST); // 看不见的时间再长，也只允许她移动有限距离
+          const cost = base + W_POS * dist * dist / k + (dist > allow ? W_JUMP * (dist - allow) : 0) + W_SIZE * Math.abs(Math.log(h / he)) + SKIP * (k - 1) + (k > 1 && occupied[i][j] ? W_STEAL : 0);
+          // 运动惯性：和上一段的速度比，突然反向/急转（交叉时被换人的典型特征）要付代价
+          let acc = 0;
+          const pp = back[p][2 * q], pq = back[p][2 * q + 1];
+          if (W_ACC && pp >= 0) {
+            const f = samples[pp].dets[pq], dt1 = (p - pp) / fps, dt2 = k / fps;
+            const v1x = (cx(e.box) - cx(f.box)) / dt1, v1y = (cy(e.box) - cy(f.box)) / dt1;
+            const v2x = (c[0] - cx(e.box)) / dt2, v2y = (c[1] - cy(e.box)) / dt2;
+            acc = W_ACC * Math.hypot(v2x - v1x, v2y - v1y) / hm * Math.min(1, dt2 * 2);
+          }
+          const tot = cost + acc;
+          if (tot < bv) { bv = tot; bi = p; bj = q; }
         }
       }
       best[i][j] = bv + unary[i][j];
@@ -133,6 +147,28 @@ export function solveTrack(samples, anchors, opts = {}) {
     }
   }
   for (let m = 0; m < nodes[0][0]; m++) res[m] = { det: -1, box: res[nodes[0][0]].box.slice(), conf: 0 };
+  // 可信度：没找到她（持续 >0.6s），或旁边有个很像的人（可能跟错）
+  for (let i = 0; i < n; i++) {
+    const r = res[i]; if (r.det < 0) continue;
+    const d = samples[i].dets[r.det], sv = histSim(ref, d.hist), h = bh(d.box);
+    for (let j = 0; j < samples[i].dets.length; j++) {
+      if (j === r.det) continue; const e = samples[i].dets[j];
+      const dist = Math.hypot(cx(e.box) - cx(d.box), cy(e.box) - cy(d.box)) / h;
+      if (dist < 0.55 && histSim(ref, e.hist) > sv - 0.1 && Math.abs(Math.log(bh(e.box) / h)) < 0.4) { r.conf = 0.3; r.ambiguous = true; break; }
+    }
+  }
+  const warn = []; let st = -1, kind = '';
+  const flag = i => res[i].det < 0 ? 'lost' : res[i].ambiguous ? 'close' : '';
+  for (let i = 0; i <= n; i++) {
+    const f = i < n ? flag(i) : '';
+    if (f && st < 0) { st = i; kind = f; }
+    else if (st >= 0 && f !== kind) {
+      const dur = samples[i - 1].t - samples[st].t;
+      if (kind === 'close' ? dur >= 0.25 : dur >= 0.6) warn.push({ t0: samples[st].t, t1: samples[i - 1].t, i: st, kind });
+      st = f ? i : -1; kind = f;
+    }
+  }
+  res.warnings = warn;
   return res;
 }
 
