@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="直拍">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+<title>直拍</title>
+</head>
+<body>
+<header><h1>直拍 <small>练舞视频一键跟拍</small></h1></header>
+<main>
+  <section id="s-import" class="card">
+    <h2>1 · 选视频</h2>
+    <label class="btn primary big">从相册选择练舞视频
+      <input id="file" type="file" accept="video/*" hidden>
+    </label>
+    <p class="hint">视频只在手机上处理，不会上传。建议 1 分钟以内。</p>
+    <div id="import-status" class="status"></div>
+  </section>
+
+  <section id="s-select" class="card" hidden>
+    <h2>2 · 点一下你自己</h2>
+    <div class="viewwrap"><canvas id="view"></canvas><div id="viewtip" class="viewtip"></div></div>
+    <div class="row">
+      <button id="play" class="btn">▶︎ 播放</button>
+      <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+      <span id="tlabel" class="mono">0.0s</span>
+    </div>
+    <div class="row seg" id="viewmode">
+      <button data-v="full" class="on">原画面</button><button data-v="crop">直拍预览</button>
+    </div>
+    <p class="hint" id="select-hint">暂停后点画面里的你（粉色框 = 正在跟的人）。如果中途跟错了，拖到跟错的那一刻，再点一下自己就能纠正。</p>
+    <div class="row"><span id="anchors" class="hint"></span><button id="undo" class="btn small" hidden>撤销上一次点选</button></div>
+    <div id="warns" class="warns"></div>
+  </section>
+
+  <section id="s-focus" class="card" hidden>
+    <h2>3 · 聚焦程度</h2>
+    <div class="row seg" id="focus">
+      <button data-f="loose" class="on">全身宽松</button><button data-f="tight">全身紧</button><button data-f="half">半身</button>
+    </div>
+    <p class="hint">输出为竖屏 9:16。切到上面的「直拍预览」可以看效果。</p>
+  </section>
+
+  <section id="s-audio" class="card" hidden>
+    <h2>4 · 音频对齐 <small>（可选）</small></h2>
+    <label class="btn">选择原曲 / 教程音频（文件 App）
+      <input id="afile" type="file" accept="audio/*,video/*,.mp3,.m4a,.wav,.aac,.flac" hidden>
+    </label>
+    <div id="afile-name" class="hint"></div>
+    <div class="row"><span class="lbl">练习时的倍速</span>
+      <select id="speed">
+        <option value="auto">自动识别</option>
+        <option value="1" selected>1.0x</option>
+        <option value="0.95">0.95x</option>
+        <option value="0.9">0.9x</option>
+        <option value="0.85">0.85x</option>
+        <option value="0.8">0.8x</option>
+        <option value="0.75">0.75x</option>
+        <option value="0.7">0.7x</option>
+        <option value="0.5">0.5x</option>
+        <option value="custom">自定义…</option>
+      </select>
+      <input id="speed-custom" type="number" min="0.3" max="2" step="0.01" value="1" hidden>
+    </div>
+    <button id="align" class="btn primary" disabled>自动对齐</button>
+    <div id="align-status" class="status"></div>
+    <div id="align-tune" hidden>
+      <div id="cand-wrap" hidden>
+        <div class="row"><span class="lbl">视频开头在原曲的</span></div>
+        <div class="row seg" id="cands"></div>
+        <p class="hint">副歌会重复，自动可能认错到后面那遍。点别的位置试听，选对的那个。</p>
+      </div>
+      <div class="row"><span class="lbl">手动起点</span>
+        <input id="man-off" type="number" step="0.1" style="width:90px"> <span class="hint">秒</span>
+        <button class="btn small" id="man-apply">用这个</button>
+      </div>
+      <div class="row"><span class="lbl">粗调</span>
+        <button class="btn small" data-n="-1">-1s</button><button class="btn small" data-n="-0.2">-0.2s</button>
+        <button class="btn small" data-n="0.2">+0.2s</button><button class="btn small" data-n="1">+1s</button>
+      </div>
+      <div class="row"><span class="lbl">微调</span>
+        <button class="btn small" data-n="-0.05">-0.05s</button><button class="btn small" data-n="-0.01">-0.01s</button>
+        <button class="btn small" data-n="0.01">+0.01s</button><button class="btn small" data-n="0.05">+0.05s</button>
+      </div>
+      <div class="row seg" id="amode">
+        <button data-m="ref" class="on">换成原曲</button><button data-m="mix">原曲+现场声</button><button data-m="orig">保留原声</button>
+      </div>
+      <p class="hint">点「▶︎ 播放」可以听对齐效果。</p>
+    </div>
+  </section>
+
+  <section id="s-export" class="card" hidden>
+    <h2>5 · 导出</h2>
+    <div class="row seg" id="res"><button data-r="720" class="on">720p</button><button data-r="1080">1080p</button></div>
+    <button id="export" class="btn primary big">生成直拍视频</button>
+    <div id="export-status" class="status"></div>
+    <div id="result" hidden>
+      <video id="outvideo" playsinline controls></video>
+      <button id="share" class="btn primary big">保存到相册 / 分享</button>
+      <a id="download" class="btn" download="直拍.mp4">下载文件</a>
+      <p class="hint">点「保存到相册」后，在弹出的菜单里选「存储视频」。</p>
+    </div>
+  </section>
+  <video id="srcvideo" playsinline muted preload="auto" style="position:fixed;left:-10px;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
+  <p class="foot">v1.4 测试版（音乐对齐候选） · <span id="caps"></span></p>
+</main>
+<script>
+function showBootErr(msg){var el=document.getElementById('import-status');if(el&&!window.__appReady)el.innerHTML='<span class="err">加载失败：'+msg+'</span><br><button class="btn" onclick="location.reload()">重新加载</button>';}
+window.addEventListener('error',function(e){if(window.__appReady)return;var t=e.target;if(t&&t.tagName==='SCRIPT')showBootErr('脚本下载失败（网络慢？）');else showBootErr((e.message||'脚本错误')+' @'+String(e.filename||'').split('/').pop()+':'+(e.lineno||''));},true);
+window.addEventListener('unhandledrejection',function(e){if(!window.__appReady)showBootErr(String(e.reason&&e.reason.message||e.reason));});
+document.getElementById('file').addEventListener('change',function(){if(!window.__appReady)showBootErr('程序还没加载完，请稍等几秒或点重新加载');});
+setTimeout(function(){if(!window.__appReady)showBootErr('程序 25 秒还没加载出来（网络慢或缓存问题）');},25000);
+</script>
+<script type="module" src="js/app-beta.js?v=1.4b1" onerror="showBootErr('js/app-beta.js 下载失败')"></script>
+</body>
+</html>
