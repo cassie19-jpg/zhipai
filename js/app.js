@@ -463,20 +463,46 @@ $('export').addEventListener('click', async () => {
     const vOk = caps.webcodecs && await canEncodeVideo('avc', { width: OW, height: OH });
     let aCodec = null;
     if (aud && caps.audioEnc) aCodec = (await canEncodeAudio('aac', { numberOfChannels: aud.ch.length, sampleRate: aud.sr })) ? 'aac' : (await canEncodeAudio('opus', { numberOfChannels: aud.ch.length, sampleRate: 48000 })) ? 'opus' : null;
-    let blob;
-    if (vOk && (!aud || aCodec)) blob = await exportWebCodecs(OW, OH, aud, aCodec, st);
-    else blob = await exportRecorder(OW, OH, aud, st);
+    let blob = null;
+    let note = '';
+    if (vOk && (!aud || aCodec)) {
+      // 依次尝试：高清失败（iOS 上偶发 Decoder failure）时自动降一档，不让用户白等
+      const plan = OW === 1080 ? [[1080, 2560], [1080, 1920], [720, 1920]] : [[720, 1920], [720, 1280]];
+      let lastErr = null;
+      for (let k = 0; k < plan.length && !blob; k++) {
+        const [w, cap] = plan[k];
+        try {
+          if (k > 0) status(st, `上一种方式失败（${lastErr && lastErr.message}），换个更省内存的方式重试…`);
+          blob = await withVideoReleased(() => exportWebCodecs(w, w * 16 / 9, aud, aCodec, st, cap));
+          if (w !== OW) note = `（1080p 在这台手机上失败了，已自动改为 ${w}p）`;
+        } catch (e) { console.error('export attempt failed', w, cap, e); lastErr = e; }
+      }
+      if (!blob) throw lastErr;
+    } else blob = await exportRecorder(OW, OH, aud, st);
     S.outBlob = blob;
     const url = URL.createObjectURL(blob);
     $('outvideo').src = url; $('download').href = url;
     $('result').hidden = false;
-    status(st, `<span class="ok">完成</span>：${(blob.size / 1048576).toFixed(1)} MB${aCodec === 'opus' ? '（音频为 Opus 编码，个别播放器可能不兼容）' : ''}`);
+    status(st, `<span class="ok">完成</span>：${(blob.size / 1048576).toFixed(1)} MB${note}${aCodec === 'opus' ? '（音频为 Opus 编码，个别播放器可能不兼容）' : ''}`);
   } catch (err) { console.error(err); status(st, `<span class="err">导出失败：${err.message || err}</span>`); }
   $('export').disabled = false;
 });
 
-async function exportWebCodecs(OW, OH, aud, aCodec, st) {
+// 导出时先释放预览用的 <video>，它在 iOS 上也占着一个硬件解码器
+async function withVideoReleased(fn) {
+  const v = $('srcvideo'), src = v.src;
+  v.pause(); v.removeAttribute('src'); v.load();
+  try { return await fn(); } finally { v.src = src; v.load(); }
+}
+
+async function exportWebCodecs(OW, OH, aud, aCodec, st, cap = 1920) {
   ensurePath();
+  if (Q.get('failExport') && cap >= +Q.get('failExport')) throw new Error('测试用：模拟失败');
+  // 先把整帧（已按旋转信息摆正）画到中间画布，再从画布裁 9:16。
+  // 不直接对 VideoFrame 用带源矩形的 drawImage：iOS Safari 会忽略源矩形，把整帧压扁塞进去（比例变形的原因）。
+  const s = Math.min(1, cap / Math.max(S.W, S.H));
+  const iw = Math.round(S.W * s), ih = Math.round(S.H * s);
+  const frameSink = new CanvasSink(S.vt, { width: iw, height: ih, fit: 'fill', poolSize: 1 });
   const canvas = document.createElement('canvas'); canvas.width = OW; canvas.height = OH;
   const ctx = canvas.getContext('2d', { alpha: false });
   const out = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
@@ -485,14 +511,17 @@ async function exportWebCodecs(OW, OH, aud, aCodec, st) {
   let asrc = null;
   if (aud && aCodec) { asrc = new AudioBufferSource({ codec: aCodec, bitrate: 160000 }); out.addAudioTrack(asrc); }
   await out.start();
-  const sink = new VideoSampleSink(S.vt);
   const t1 = performance.now();
-  for await (const sample of sink.samples(S.t0, S.t0 + S.dur)) {
-    const t = sample.timestamp - S.t0;
-    const c = cropAt(sample.timestamp);
-    sample.draw(ctx, c.x, c.y, c.w, c.h, 0, 0, OW, OH);
-    const d = sample.duration || 1 / 30;
-    sample.close();
+  ctx.imageSmoothingQuality = 'high';
+  for await (const wc of frameSink.canvases(S.t0, S.t0 + S.dur)) {
+    const t = wc.timestamp - S.t0;
+    const c = cropAt(wc.timestamp);
+    // 严格保证 9:16：以高度为准算宽度，并限制在画面内
+    let ch = Math.min(c.h * s, ih, iw * 16 / 9), cw = ch * 9 / 16;
+    const cx = Math.min(iw - cw, Math.max(0, c.x * s + (c.w * s - cw) / 2));
+    const cy = Math.min(ih - ch, Math.max(0, c.y * s + (c.h * s - ch) / 2));
+    ctx.drawImage(wc.canvas, cx, cy, cw, ch, 0, 0, OW, OH);
+    const d = wc.duration || 1 / 30;
     if (t < 0) continue;
     await vsrc.add(t, d);
     status(st, `渲染中… ${Math.min(100, Math.round(100 * t / S.dur))}%`, t / S.dur);
