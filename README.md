@@ -68,3 +68,7 @@ models/       姿态与人物检测模型
 ## 许可证
 
 本项目代码采用 [MIT](LICENSE) 协议。随附的第三方组件（MediaPipe 模型与 wasm：Apache-2.0；Mediabunny：MPL-2.0）见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+---
+
+Built with Grok Bot ⚫
