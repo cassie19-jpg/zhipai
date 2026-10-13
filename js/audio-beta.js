@@ -105,9 +105,12 @@ function nccBest(v, r, wantCands = false) {
     scores.push(sc);
     if (sc > best) { best = sc; bestK = k; }
   }
-  // 次高峰（排除 ±0.5s）
+  // 次高峰（排除 ±1.5s，避免把主峰的肩当成次峰）
   let second = 0;
-  for (let i = 0; i < scores.length; i++) { const k = i + kMin; if (Math.abs(k - bestK) > ENV_RATE * 0.5 && scores[i] > second) second = scores[i]; }
+  for (let i = 0; i < scores.length; i++) { const k = i + kMin; if (Math.abs(k - bestK) > ENV_RATE * 1.5 && scores[i] > second) second = scores[i]; }
+  // 峰的突出度：主峰比全部偏移分数的均值高多少个标准差
+  let sm = 0, sq = 0, cnt = 0; for (const x of scores) if (x !== 0) { sm += x; sq += x * x; cnt++; }
+  const mu = cnt ? sm / cnt : 0, sd = cnt ? Math.sqrt(Math.max(1e-12, sq / cnt - mu * mu)) : 1, z = (best - mu) / sd;
   // 抛物线插值亚帧
   const bi0 = bestK - kMin; let frac = 0;
   if (bi0 > 0 && bi0 < scores.length - 1) { const y0 = scores[bi0 - 1], y1 = scores[bi0], y2 = scores[bi0 + 1]; const d = y0 - 2 * y1 + y2; if (d < 0) frac = 0.5 * (y0 - y2) / d; }
@@ -115,15 +118,15 @@ function nccBest(v, r, wantCands = false) {
   const sub = i => { let f = 0; if (i > 0 && i < scores.length - 1) { const y0 = scores[i - 1], y1 = scores[i], y2 = scores[i + 1]; const d = y0 - 2 * y1 + y2; if (d < 0) f = 0.5 * (y0 - y2) / d; } return i + kMin + f; };
   const W = Math.round(ENV_RATE * 1.5), peaks = [];
   for (let i = 0; wantCands && i < scores.length; i++) {
-    const sc = scores[i]; if (!(sc > 0) || sc < best * 0.5) continue;
+    const sc = scores[i]; if (!(sc > 0) || sc < best * 0.3) continue;
     let isMax = true;
     for (let j = Math.max(0, i - W); j <= Math.min(scores.length - 1, i + W); j++) if (scores[j] > sc || (scores[j] === sc && j < i)) { isMax = false; break; }
     if (isMax) peaks.push({ lag: sub(i), score: sc });
   }
   peaks.sort((a, b) => b.score - a.score);
   const cands = [];
-  for (const p of peaks) { if (cands.every(c => Math.abs(c.lag - p.lag) >= ENV_RATE * 3)) cands.push(p); if (cands.length >= 4) break; }
-  return { lag: bestK + frac, score: best, ratio: second > 0 ? best / second : 9, cands };
+  for (const p of peaks) { if (cands.every(c => Math.abs(c.lag - p.lag) >= ENV_RATE * 3)) cands.push(p); if (cands.length >= 5) break; }
+  return { lag: bestK + frac, score: best, ratio: second > 0 ? best / second : 9, z, cands };
 }
 
 // 视频里"有声音"的区间（帧，ENV_RATE）：按 100ms RMS，去掉开头/结尾的静音段
@@ -145,7 +148,7 @@ export function activeRange(mono, sr) {
 // 返回 {speed, offset(秒，视频0时刻对应的原曲位置), score, ratio}
 export function align(videoEnvFull, refEnv, speed = null, onProgress, range = null) {
   const v0 = range ? range[0] : 0, videoEnv = range ? videoEnvFull.subarray(range[0], Math.min(range[1], videoEnvFull.length)) : videoEnvFull;
-  const test = s => { const r = nccBest(videoEnv, stretchEnv(refEnv, s)); return { speed: s, offset: (r.lag - v0) * s / ENV_RATE, score: r.score, ratio: r.ratio }; };
+  const test = s => { const r = nccBest(videoEnv, stretchEnv(refEnv, s)); return { speed: s, offset: (r.lag - v0) * s / ENV_RATE, score: r.score, ratio: r.ratio, z: r.z }; };
   if (speed) return withCands(test(speed), refEnv, videoEnv, v0);
   let best = null; const grid = [];
   for (let s = 0.5; s <= 1.301; s += 0.01) grid.push(+s.toFixed(3));
@@ -166,9 +169,23 @@ function withCands(best, refEnv, videoEnv, v0 = 0) {
   const cands = r.cands.map(c => ({ offset: (c.lag - v0) * s / ENV_RATE, score: c.score, rel: c.score / r.score }))
     .sort((a, b) => a.offset - b.offset);
   const pick = cands.find(c => c.rel >= 0.9) || cands[0];
-  const out = { ...best, cands, bestOffset: best.offset };
+  const out = { ...best, cands, bestOffset: best.offset, z: r.z, ratio: r.ratio, topScore: r.score };
   if (pick) { out.offset = pick.offset; out.score = pick.score; }
+  { const a = out.offset + s * v0 / ENV_RATE, b = a + s * videoEnv.length / ENV_RATE;
+    out.overlapSec = Math.max(0, Math.min(b, refEnv.length / ENV_RATE) - Math.max(a, 0)); }
+  out.conf = confidence(out);
   return out;
+}
+
+// 可信度（诚实版）：只看绝对相关分数会虚高——短视频/节奏均匀的歌在很多位置都"挺像"。
+// 必须同时满足：分数够高、主峰明显高于其他位置（ratio）、主峰在所有偏移里足够突出（z），
+// 且没有另一个几乎一样高的候选（副歌重复）。
+export function confidence(r) {
+  const close = (r.cands || []).filter(c => c.rel >= 0.85).length; // 含自己
+  const ov = r.overlapSec == null ? 99 : r.overlapSec;
+  if (r.topScore > 0.4 && r.ratio > 1.5 && r.z > 7 && close <= 1 && ov >= 10) return 'high';
+  if (r.topScore > 0.2 && r.ratio > 1.15 && r.z > 4.5) return close > 1 ? 'ambiguous' : 'mid';
+  return 'low';
 }
 
 // WSOLA 变速保持音调。rate>1 变快。输入/输出: Float32Array[] 每声道

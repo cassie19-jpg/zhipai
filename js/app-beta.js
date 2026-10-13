@@ -1,6 +1,6 @@
 import { Input, BlobSource, ALL_FORMATS, CanvasSink, VideoSampleSink, AudioBufferSink, Output, Mp4OutputFormat, BufferTarget, CanvasSource, AudioBufferSource, canEncodeAudio, canEncodeVideo, QUALITY_HIGH } from '../vendor/mediabunny.min.mjs';
 import { solveTrack, cameraPath } from './track.js';
-import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.1';
+import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.2';
 
 const $ = id => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -208,7 +208,7 @@ async function importVideo(file) {
 
 function resetAll() {
   S.samples = []; S.thumbs = []; thumbCache.clear(); S.anchors = new Map(); S.anchorHist = [];
-  S.track = null; S.path = null; S.origAudio = null; S.vidEnv = null; S.alignRes = null; S.aligned = null; S.outBlob = null;
+  S.track = null; S.path = null; S.origAudio = null; S.vidEnv = null; S.alignRes = null; S.aligned = null; S.outBlob = null; $('align-tune').hidden = true;
   $('result').hidden = true; $('export-status').innerHTML = ''; $('align-status').innerHTML = '';
 }
 
@@ -371,13 +371,16 @@ document.querySelectorAll('#focus button').forEach(b => b.addEventListener('clic
 
 // 播放（带对齐音频预览）
 let playing = false, rafId = 0, audioCtx = null, audioNode = null;
-async function startPlay() {
+async function startPlay(fromT = null) {
   const v = $('srcvideo');
-  v.currentTime = Math.max(0, S.samples[S.cur].t - S.t0);
+  if (S.alignDirty) await renderAlignedAudio();
+  if (fromT != null) { fromT = Math.max(0, Math.min(S.dur - 0.5, fromT)); S.cur = sampleAt(fromT + S.t0); }
+  v.currentTime = fromT != null ? fromT : Math.max(0, S.samples[S.cur].t - S.t0);
+  if (fromT != null) await new Promise(r => { let done = false; const f = () => { if (!done) { done = true; r(); } }; v.addEventListener('seeked', f, { once: true }); setTimeout(f, 600); });
   const useRef = S.aligned && S.amode !== 'orig';
   v.muted = !!(useRef && S.amode === 'ref');
   v.volume = S.amode === 'mix' ? 0.4 : 1;
-  playing = true; $('play').textContent = '❚❚ 暂停';
+  playing = true; $('play').textContent = '❚❚ 暂停'; $('aprev').textContent = '❚❚ 停止试听';
   if (useRef) {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     await audioCtx.resume();
@@ -394,7 +397,7 @@ async function startPlay() {
 }
 function stopPlay() {
   if (!playing) return;
-  playing = false; cancelAnimationFrame(rafId); $('play').textContent = '▶︎ 播放';
+  playing = false; cancelAnimationFrame(rafId); $('play').textContent = '▶︎ 播放'; $('aprev').textContent = '▶︎ 试听对齐点（前 3 秒开始）';
   $('srcvideo').pause();
   if (audioNode) { try { audioNode.stop(); } catch { } audioNode = null; }
   draw();
@@ -406,7 +409,7 @@ $('afile').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return; e.target.value = '';
   $('afile-name').textContent = '读取中… ' + f.name;
   try {
-    S.ref = await decodeAnyAudio(f); S.refEnv = null; S.alignRes = null; S.aligned = null;
+    S.ref = await decodeAnyAudio(f); S.refEnv = null; S.alignRes = null; S.aligned = null; $('align-tune').hidden = true;
     $('afile-name').textContent = `✓ ${f.name}（${fmt(S.ref.ch[0].length / S.ref.sr)}）`;
   } catch (err) { console.error(err); $('afile-name').innerHTML = `<span class="err">读不了这个文件：${err.message || err}</span>`; S.ref = null; }
   updateAlignBtn();
@@ -440,56 +443,134 @@ $('align').addEventListener('click', async () => {
     const speed = sv === 'auto' ? null : sv === 'custom' ? parseFloat($('speed-custom').value) : parseFloat(sv);
     status(st, speed ? '对齐中…' : '自动识别倍速 + 对齐中…', 0.3); await sleep(30);
     const r = align(S.vidEnv, S.refEnv, speed, null, S.vidRange);
-    S.alignRes = r; S.nudge = 0;
+    S.alignRes = r; S.autoOffset = r.offset;
     await renderAlignedAudio();
-    const conf = r.score > 0.35 ? '<span class="ok">高</span>' : r.score > 0.18 ? '<span class="warn">中</span>' : '<span class="err">低（可能不是同一首歌/版本）</span>';
-    S.alignConf = conf;
-    showAlignStatus();
-    renderCands();
-    $('man-off').value = r.offset.toFixed(2);
     $('align-tune').hidden = false;
+    refreshAlignUI();
   } catch (err) { console.error(err); status(st, `<span class="err">对齐失败：${err.message || err}</span>`); }
 });
 const mmss = t => { const s = Math.abs(t), m = Math.floor(s / 60); return `${t < 0 ? '-' : ''}${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`; };
-function showAlignStatus() {
-  const r = S.alignRes;
-  status($('align-status'), `倍速 ${r.speed.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x，${r.offset < 0 ? `原曲从视频第 ${(-r.offset / r.speed).toFixed(1)}s 开始` : `视频开头对应原曲 ${mmss(r.offset)}`}（offset ${r.offset.toFixed(2)}s），可信度 ${S.alignConf}${S.nudge ? `（微调 ${S.nudge >= 0 ? '+' : ''}${S.nudge.toFixed(2)}s）` : ''}`);
+const refDur = () => S.ref.ch[0].length / S.ref.sr;
+// offset = 视频 0 秒时原曲播到的位置（秒，可为负）。原曲 0 秒出现在视频的 -offset/speed 秒
+const vidTimeOfSong0 = o => -o / S.alignRes.speed;
+const CONF = { high: '<span class="ok">高</span>', mid: '<span class="warn">中（建议点候选听一下）</span>', ambiguous: '<span class="warn">不确定：有几个位置几乎一样像（副歌重复），请逐个试听</span>', low: '<span class="err">低：可能对错了，请试听或用手动/敲拍</span>' };
+function describe(o) {
+  return o <= 0 ? `原曲从视频第 ${(vidTimeOfSong0(o)).toFixed(2)} 秒开始响` : `视频开头＝原曲 ${mmss(o)}（原曲在视频之前就开始了）`;
 }
+function showAlignStatus() {
+  const r = S.alignRes, manual = Math.abs(r.offset - S.autoOffset) > 0.005;
+  status($('align-status'), `倍速 ${r.speed.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x · ${describe(r.offset)}<br>${manual ? '当前是<b>手动设置</b>' : `自动结果可信度 ${CONF[r.conf] || CONF.low}`}`);
+}
+function refreshAlignUI() { showAlignStatus(); renderCands(); syncManual(); }
 function renderCands() {
   const r = S.alignRes, box = $('cands'); box.innerHTML = '';
-  const cs = r.cands || [];
-  $('cand-wrap').hidden = cs.length < 2;
-  cs.forEach(c => {
+  const cs = (r.cands || []).slice().sort((a, b) => b.rel - a.rel).slice(0, 5);
+  if (!cs.length) { box.innerHTML = '<span class="hint">没有找到别的像的位置</span>'; return; }
+  cs.forEach((c, i) => {
     const b = document.createElement('button');
-    b.textContent = `${mmss(c.offset)}${c.rel >= 0.999 ? ' ★' : ''}`;
-    b.title = `匹配度 ${(c.rel * 100).toFixed(0)}%`;
+    b.innerHTML = `<span>${i === 0 ? '★ ' : ''}${describe(c.offset)}</span><span>${Math.round(c.rel * 100)}%</span>`;
     b.classList.toggle('on', Math.abs(c.offset - r.offset) < 0.05);
-    b.addEventListener('click', async () => {
-      stopPlay(); r.offset = c.offset; r.score = c.score; S.nudge = 0;
-      box.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
-      $('man-off').value = c.offset.toFixed(2);
-      await renderAlignedAudio(); showAlignStatus();
-    });
+    b.addEventListener('click', async () => { stopPlay(); await setOffset(c.offset); previewAround(); });
     box.appendChild(b);
   });
 }
-$('man-apply').addEventListener('click', async () => {
-  const v = parseFloat($('man-off').value); if (!S.alignRes || !isFinite(v)) return;
-  stopPlay(); S.alignRes.offset = v; S.nudge = 0;
-  $('cands').querySelectorAll('button').forEach(x => x.classList.remove('on'));
-  await renderAlignedAudio(); showAlignStatus();
-});
-async function renderAlignedAudio() {
-  const r = S.alignRes; const outSr = S.origAudio ? S.origAudio.sr : 44100;
-  const ch = renderAligned(S.ref.ch, S.ref.sr, r.offset + S.nudge * r.speed, r.speed, S.dur, outSr);
-  S.aligned = { sr: outSr, ch };
+// —— 手动设置：两种说法，同一个 offset ——
+S.mmode = 'vid';
+function manualVal() { const o = S.alignRes.offset; return S.mmode === 'vid' ? vidTimeOfSong0(o) : o; }
+function valToOffset(x) { return S.mmode === 'vid' ? -x * S.alignRes.speed : x; }
+function syncManual() {
+  if (!S.alignRes) return;
+  if (!S.mmodeLock) { const want = S.alignRes.offset <= 0 ? 'vid' : 'song'; if (want !== S.mmode) { S.mmode = want; document.querySelectorAll('#mmode button').forEach(x => x.classList.toggle('on', x.dataset.mm === want)); } }
+  S.mmodeLock = false;
+  const sl = $('mslider'), x = manualVal();
+  if (S.mmode === 'vid') { sl.min = 0; sl.max = Math.max(1, S.dur - 1).toFixed(1); }
+  else { sl.min = 0; sl.max = Math.max(1, refDur() - 1).toFixed(1); }
+  sl.value = x.toFixed(2);
+  const out = S.mmode === 'vid' ? (x >= 0 ? `原曲从视频第 ${x.toFixed(2)} 秒响` : '（原曲在视频开始前就响了→切到右边那种说法）')
+    : (x >= 0 ? `视频开头＝原曲 ${mmss(x)}` : '（原曲在视频中途才响→切到左边那种说法）');
+  $('mreadout').textContent = out;
+  $('mhint').textContent = S.mmode === 'vid' ? '适合：视频开头有一段空白/说话，音乐后来才响。' : '适合：录的时候音乐早就在放，视频是从歌中间开始的。';
 }
-document.querySelectorAll('#align-tune [data-n]').forEach(b => b.addEventListener('click', async () => {
-  S.nudge = +(S.nudge + parseFloat(b.dataset.n)).toFixed(2); stopPlay(); await renderAlignedAudio(); showAlignStatus();
+let renderTimer = 0;
+async function setOffset(o, debounce = false) {
+  const r = S.alignRes; if (!r) return;
+  r.offset = +o.toFixed(3); S.alignDirty = true;
+  showAlignStatus(); syncManual();
+  $('cands').querySelectorAll('button').forEach((b, i) => b.classList.remove('on'));
+  renderCands();
+  clearTimeout(renderTimer);
+  if (debounce) { renderTimer = setTimeout(() => renderAlignedAudio(), 250); return; }
+  await renderAlignedAudio();
+}
+document.querySelectorAll('#mmode button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#mmode button').forEach(x => x.classList.toggle('on', x === b)); S.mmode = b.dataset.mm; S.mmodeLock = true; syncManual();
 }));
+$('mslider').addEventListener('input', () => { stopPlay(); setOffset(valToOffset(parseFloat($('mslider').value)), true); });
+document.querySelectorAll('#align-tune [data-n]').forEach(b => b.addEventListener('click', async () => {
+  if (!S.alignRes) return; stopPlay();
+  // 按钮的含义跟随当前说法：+ = 数字变大
+  await setOffset(valToOffset(manualVal() + parseFloat(b.dataset.n)));
+}));
+function parseTime(str) {
+  str = String(str || '').trim().replace(/[，,。]/g, '.').replace(/[：]/g, ':').replace(/[^\d.:\-]/g, '');
+  if (!str) return NaN;
+  if (str.includes(':')) { const [m, s] = str.split(':'); return (+m || 0) * 60 + (parseFloat(s) || 0); }
+  return parseFloat(str);
+}
+$('man-off').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('man-apply').click(); } });
+$('man-apply').addEventListener('click', async () => {
+  const x = parseTime($('man-off').value);
+  if (!S.alignRes) return;
+  if (!isFinite(x)) { $('mhint').textContent = '没看懂这个数字，输入秒数如 15 或 15.5，或 1:05.5'; return; }
+  stopPlay(); $('man-off').blur();
+  await setOffset(valToOffset(x)); previewAround();
+});
+// 试听：从对齐点前 3 秒开始播（模式"原曲从视频第X秒响"时对齐点就是 X；否则从当前进度条位置前 3 秒）
+function previewAround() {
+  const r = S.alignRes; if (!r) return;
+  if (S.amode === 'orig') { document.querySelector('#amode [data-m="mix"]').click(); }
+  const x = vidTimeOfSong0(r.offset);
+  const cur = Math.max(0, S.samples[S.cur].t - S.t0);
+  const at = x > 0.5 && x < S.dur - 1 ? x : cur > 3 ? cur : (S.vidRange ? S.vidRange[0] / 100 + 3 : 3);
+  startPlay(Math.max(0, at - 3));
+}
+$('aprev').addEventListener('click', () => playing ? stopPlay() : previewAround());
+async function renderAlignedAudio() {
+  const r = S.alignRes; if (!r) return; const outSr = S.origAudio ? S.origAudio.sr : 44100;
+  const ch = renderAligned(S.ref.ch, S.ref.sr, r.offset, r.speed, S.dur, outSr);
+  S.aligned = { sr: outSr, ch }; S.alignDirty = false;
+}
 document.querySelectorAll('#amode button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('#amode button').forEach(x => x.classList.toggle('on', x === b)); S.amode = b.dataset.m; stopPlay();
 }));
+// —— 敲拍对齐 ——
+const TAP = { mode: null, v: null, s: null, node: null, ctx0: 0, s0: 0 };
+function tapStop() { if (TAP.node) { try { TAP.node.stop(); } catch { } TAP.node = null; } if (TAP.mode === 'v') { $('srcvideo').pause(); } TAP.mode = null; }
+function tapShow() { $('tap-status').innerHTML = `视频那一拍：${TAP.v == null ? '—' : TAP.v.toFixed(2) + 's'} · 原曲那一拍：${TAP.s == null ? '—' : TAP.s.toFixed(2) + 's'}`; }
+$('tap-v').addEventListener('click', async () => {
+  stopPlay(); tapStop(); const v = $('srcvideo');
+  v.muted = false; v.volume = 1; v.currentTime = Math.max(0, S.samples[S.cur].t - S.t0);
+  await v.play().catch(() => { }); TAP.mode = 'v'; $('tap-status').textContent = '视频播放中，听到第一下重拍就点「这一拍！」';
+});
+$('tap-s').addEventListener('click', async () => {
+  stopPlay(); tapStop();
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume();
+  const s0 = Math.max(0, parseTime($('tap-s0').value) || 0);
+  const buf = audioCtx.createBuffer(S.ref.ch.length, S.ref.ch[0].length, S.ref.sr); S.ref.ch.forEach((c, k) => buf.copyToChannel(c, k));
+  TAP.node = audioCtx.createBufferSource(); TAP.node.buffer = buf; TAP.node.connect(audioCtx.destination);
+  TAP.node.start(0, s0); TAP.ctx0 = audioCtx.currentTime; TAP.s0 = s0; TAP.mode = 's';
+  $('tap-status').textContent = '原曲播放中，在同一拍点「这一拍！」';
+});
+$('tap-hit').addEventListener('click', async () => {
+  if (TAP.mode === 'v') { TAP.v = $('srcvideo').currentTime; tapStop(); }
+  else if (TAP.mode === 's') { const lat = audioCtx.outputLatency || audioCtx.baseLatency || 0; TAP.s = TAP.s0 + audioCtx.currentTime - TAP.ctx0 - lat; tapStop(); }
+  else { $('tap-status').textContent = '先点 ① 或 ② 开始播放'; return; }
+  tapShow();
+  if (TAP.v != null && TAP.s != null && S.alignRes) {
+    await setOffset(TAP.s - S.alignRes.speed * TAP.v);
+    $('tap-status').innerHTML += '<br>已按敲拍对齐，点上面「试听」检查，再用 ±0.05 微调。';
+  }
+});
 
 function finalAudio() {
   const o = S.origAudio, a = S.aligned;
@@ -512,6 +593,7 @@ $('export').addEventListener('click', async () => {
   const st = $('export-status'); $('export').disabled = true; $('result').hidden = true;
   try {
     const OW = S.res === 1080 ? 1080 : 720, OH = OW * 16 / 9;
+    if (S.alignDirty) await renderAlignedAudio();
     const aud = finalAudio();
     const vOk = caps.webcodecs && await canEncodeVideo('avc', { width: OW, height: OH });
     let aCodec = null;

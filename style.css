@@ -31,3 +31,12 @@ select,input[type=number]{background:#2c2c2e;color:var(--fg);border:0;border-rad
 .foot{color:#555;font-size:11px;text-align:center}
 .warn{color:#ffb340}.ok{color:#5fd38d}.err{color:#ff6b6b}
 .warns{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}.warns:empty{display:none}.warns .w{background:#3a2a10;color:#ffb340;border:0;border-radius:8px;padding:5px 9px;font-size:13px}.warns .w.lost{background:#2c2c2e;color:#bbb}
+.cands{display:flex;flex-direction:column;gap:6px;margin:6px 0}
+.cands button{display:flex;justify-content:space-between;border:0;border-radius:10px;padding:12px;background:#2c2c2e;color:var(--fg);font-size:15px}
+.cands button.on{background:var(--pink);color:#fff;font-weight:600}
+.readout{font-size:26px;font-weight:700;text-align:center;margin:8px 0}
+.bigslider{width:100%;height:36px;accent-color:var(--pink)}
+.nudges{flex-wrap:nowrap;gap:4px}.nudges .btn{flex:1;padding:12px 0;font-size:14px}
+.tin{background:#2c2c2e;color:var(--fg);border:0;border-radius:8px;padding:8px;font-size:16px;width:130px}
+.tapsync{margin:10px 0}.tapsync summary{color:var(--pink);padding:6px 0}
+#tap-hit{flex:1;padding:16px}
