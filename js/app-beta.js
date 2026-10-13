@@ -1,6 +1,6 @@
 import { Input, BlobSource, ALL_FORMATS, CanvasSink, VideoSampleSink, AudioBufferSink, Output, Mp4OutputFormat, BufferTarget, CanvasSource, AudioBufferSource, canEncodeAudio, canEncodeVideo, QUALITY_HIGH } from '../vendor/mediabunny.min.mjs';
 import { solveTrack, cameraPath } from './track.js';
-import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.2';
+import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.3';
 
 const $ = id => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -371,6 +371,22 @@ document.querySelectorAll('#focus button').forEach(b => b.addEventListener('clic
 
 // 播放（带对齐音频预览）
 let playing = false, rafId = 0, audioCtx = null, audioNode = null;
+// iOS 解锁：必须在用户手势里同步 resume + 播一段静音；audioSession=playback 让静音键下也出声（Safari 16.4+）
+try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { }
+function unlockAudio() {
+  try {
+    if (navigator.audioSession && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback';
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state !== 'running') audioCtx.resume();
+    const b = audioCtx.createBuffer(1, 1, 22050), n = audioCtx.createBufferSource(); n.buffer = b; n.connect(audioCtx.destination); n.start(0);
+  } catch (e) { console.warn(e); }
+}
+['touchend', 'pointerup', 'click', 'keydown'].forEach(t => document.addEventListener(t, unlockAudio, { capture: true, passive: true }));
+function audioWarn() {
+  let el = document.getElementById('audio-lock');
+  if (!el) { el = document.createElement('button'); el.id = 'audio-lock'; el.className = 'btn'; el.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:99;background:#e55;color:#fff'; el.textContent = '🔇 没声音？点一下解锁声音'; el.addEventListener('click', () => { unlockAudio(); setTimeout(() => { if (audioCtx && audioCtx.state === 'running') el.remove(); }, 300); }); document.body.appendChild(el); }
+}
+function checkAudio() { setTimeout(() => { if (playing && audioCtx && audioCtx.state !== 'running') audioWarn(); else { const el = document.getElementById('audio-lock'); el && el.remove(); } }, 400); }
 async function startPlay(fromT = null) {
   const v = $('srcvideo');
   if (S.alignDirty) await renderAlignedAudio();
@@ -383,7 +399,7 @@ async function startPlay(fromT = null) {
   playing = true; $('play').textContent = '❚❚ 暂停'; $('aprev').textContent = '❚❚ 停止试听';
   if (useRef) {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    await audioCtx.resume();
+    if (audioCtx.state !== 'running') audioCtx.resume().catch(() => { });
   }
   await v.play().catch(err => { console.warn(err); v.muted = true; return v.play(); });
   if (useRef) {
@@ -391,6 +407,7 @@ async function startPlay(fromT = null) {
     S.aligned.ch.forEach((c, k) => buf.copyToChannel(c, k));
     audioNode = audioCtx.createBufferSource(); audioNode.buffer = buf; audioNode.connect(audioCtx.destination);
     audioNode.start(0, v.currentTime);
+    checkAudio();
   }
   const loop = () => { if (!playing) return; draw(v); const i = sampleAt(v.currentTime + S.t0); S.cur = i; $('scrub').value = Math.round(1000 * v.currentTime / S.dur); $('tlabel').textContent = fmt(v.currentTime); if (v.ended) { stopPlay(); return; } rafId = requestAnimationFrame(loop); };
   loop();
@@ -554,7 +571,7 @@ $('tap-v').addEventListener('click', async () => {
 });
 $('tap-s').addEventListener('click', async () => {
   stopPlay(); tapStop();
-  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume();
+  unlockAudio();
   const s0 = Math.max(0, parseTime($('tap-s0').value) || 0);
   const buf = audioCtx.createBuffer(S.ref.ch.length, S.ref.ch[0].length, S.ref.sr); S.ref.ch.forEach((c, k) => buf.copyToChannel(c, k));
   TAP.node = audioCtx.createBufferSource(); TAP.node.buffer = buf; TAP.node.connect(audioCtx.destination);
