@@ -88,13 +88,15 @@ function nccBest(v, r, wantCands = false) {
   fftInPlace(ar, ai); // 共轭技巧做逆变换
   const cs = new Float64Array(Nr + 1), cs2 = new Float64Array(Nr + 1);
   for (let i = 0; i < Nr; i++) { cs[i + 1] = cs[i] + r[i]; cs2[i + 1] = cs2[i] + r[i] * r[i]; }
-  // 允许视频比原曲先开始（负延迟）最多 Nv/2
+  // 任意方向偏移：视频可比原曲早开始，也可从歌中间开始。最少重叠 min(5s, 较短者 60%)
+  // 分数按视频全长归一化 = 整段重叠的总相似度（长上下文），短片段碰巧像不会赢
   const scores = [];
   let best = -Infinity, bestK = 0;
-  const kMin = -Math.floor(Nv / 2), kMax = Nr - Math.floor(Nv / 2);
+  const minOv = Math.max(Math.min(ENV_RATE * 5, Math.min(Nv, Nr)), Math.floor(Math.min(Nv, Nr) * 0.6));
+  const kMin = -(Nv - minOv), kMax = Nr - minOv + 1;
   for (let k = kMin; k < kMax; k++) {
     const a = Math.max(0, k), b = Math.min(Nr, k + Nv);
-    if (b - a < Nv / 2) { scores.push(0); continue; }
+    if (b - a < minOv) { scores.push(0); continue; }
     const len = b - a, mean = (cs[b] - cs[a]) / len;
     const varr = (cs2[b] - cs2[a]) - len * mean * mean;
     const idx = ((k % size) + size) % size;
@@ -124,11 +126,27 @@ function nccBest(v, r, wantCands = false) {
   return { lag: bestK + frac, score: best, ratio: second > 0 ? best / second : 9, cands };
 }
 
+// 视频里"有声音"的区间（帧，ENV_RATE）：按 100ms RMS，去掉开头/结尾的静音段
+export function activeRange(mono, sr) {
+  const hop = Math.round(sr / ENV_RATE), n = Math.floor(mono.length / hop), e = new Float32Array(n);
+  for (let f = 0; f < n; f++) { let s = 0; for (let i = f * hop, j = i + hop; i < j; i++) s += mono[i] * mono[i]; e[f] = s / hop; }
+  const w = 10, sm = new Float32Array(n);
+  for (let f = 0; f < n; f++) { let s = 0, c = 0; for (let k = Math.max(0, f - w); k < Math.min(n, f + w); k++) { s += e[k]; c++; } sm[f] = Math.sqrt(s / c); }
+  const sorted = Array.from(sm).sort((a, b) => a - b), loud = sorted[Math.floor(n * 0.9)] || 0;
+  const floor = sorted[Math.floor(n * 0.1)] || 0;
+  if (loud < floor * 2) return [0, n]; // 全程差不多响，不裁
+  const th = floor + 0.25 * (loud - floor);
+  let a = 0, b = n; while (a < n && sm[a] < th) a++; while (b > a && sm[b - 1] < th) b--;
+  if (b - a < ENV_RATE * 5) return [0, n];
+  return [Math.max(0, a - 20), Math.min(n, b + 20)];
+}
+
 // 对齐：videoEnv/refEnv 为 onsetEnvelope 结果。speed = null 表示自动检测。
 // 返回 {speed, offset(秒，视频0时刻对应的原曲位置), score, ratio}
-export function align(videoEnv, refEnv, speed = null, onProgress) {
-  const test = s => { const r = nccBest(videoEnv, stretchEnv(refEnv, s)); return { speed: s, offset: r.lag * s / ENV_RATE, score: r.score, ratio: r.ratio }; };
-  if (speed) return withCands(test(speed), refEnv, videoEnv);
+export function align(videoEnvFull, refEnv, speed = null, onProgress, range = null) {
+  const v0 = range ? range[0] : 0, videoEnv = range ? videoEnvFull.subarray(range[0], Math.min(range[1], videoEnvFull.length)) : videoEnvFull;
+  const test = s => { const r = nccBest(videoEnv, stretchEnv(refEnv, s)); return { speed: s, offset: (r.lag - v0) * s / ENV_RATE, score: r.score, ratio: r.ratio }; };
+  if (speed) return withCands(test(speed), refEnv, videoEnv, v0);
   let best = null; const grid = [];
   for (let s = 0.5; s <= 1.301; s += 0.01) grid.push(+s.toFixed(3));
   grid.forEach((s, i) => { const r = test(s); if (!best || r.score > best.score) best = r; onProgress && onProgress((i + 1) / (grid.length + 20)); });
@@ -139,13 +157,13 @@ export function align(videoEnv, refEnv, speed = null, onProgress) {
     if (Math.abs(p - best.speed) <= 0.006) { const r = test(p); if (r.score >= best.score * 0.97) best = r; }
   }
   onProgress && onProgress(1);
-  return withCands(best, refEnv, videoEnv);
+  return withCands(best, refEnv, videoEnv, v0);
 }
 
 // 附上候选位置（副歌重复时会有好几个几乎一样高的峰），默认选"分数够接近里最靠前的那个"
-function withCands(best, refEnv, videoEnv) {
+function withCands(best, refEnv, videoEnv, v0 = 0) {
   const s = best.speed, r = nccBest(videoEnv, stretchEnv(refEnv, s), true);
-  const cands = r.cands.map(c => ({ offset: c.lag * s / ENV_RATE, score: c.score, rel: c.score / r.score }))
+  const cands = r.cands.map(c => ({ offset: (c.lag - v0) * s / ENV_RATE, score: c.score, rel: c.score / r.score }))
     .sort((a, b) => a.offset - b.offset);
   const pick = cands.find(c => c.rel >= 0.9) || cands[0];
   const out = { ...best, cands, bestOffset: best.offset };

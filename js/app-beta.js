@@ -1,6 +1,6 @@
 import { Input, BlobSource, ALL_FORMATS, CanvasSink, VideoSampleSink, AudioBufferSink, Output, Mp4OutputFormat, BufferTarget, CanvasSource, AudioBufferSource, canEncodeAudio, canEncodeVideo, QUALITY_HIGH } from '../vendor/mediabunny.min.mjs';
 import { solveTrack, cameraPath } from './track.js';
-import { onsetEnvelope, align, renderAligned, toMono } from './audio-beta.js';
+import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.1';
 
 const $ = id => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -434,12 +434,12 @@ $('align').addEventListener('click', async () => {
   const st = $('align-status');
   try {
     status(st, '分析节拍…', 0.05); await sleep(30);
-    if (!S.vidEnv) S.vidEnv = onsetEnvelope(toMono(S.origAudio.ch), S.origAudio.sr);
+    if (!S.vidEnv) { const m = toMono(S.origAudio.ch); S.vidEnv = onsetEnvelope(m, S.origAudio.sr); S.vidRange = activeRange(m, S.origAudio.sr); }
     if (!S.refEnv) S.refEnv = onsetEnvelope(toMono(S.ref.ch), S.ref.sr);
     const sv = $('speed').value;
     const speed = sv === 'auto' ? null : sv === 'custom' ? parseFloat($('speed-custom').value) : parseFloat(sv);
     status(st, speed ? '对齐中…' : '自动识别倍速 + 对齐中…', 0.3); await sleep(30);
-    const r = align(S.vidEnv, S.refEnv, speed);
+    const r = align(S.vidEnv, S.refEnv, speed, null, S.vidRange);
     S.alignRes = r; S.nudge = 0;
     await renderAlignedAudio();
     const conf = r.score > 0.35 ? '<span class="ok">高</span>' : r.score > 0.18 ? '<span class="warn">中</span>' : '<span class="err">低（可能不是同一首歌/版本）</span>';
@@ -453,7 +453,7 @@ $('align').addEventListener('click', async () => {
 const mmss = t => { const s = Math.abs(t), m = Math.floor(s / 60); return `${t < 0 ? '-' : ''}${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`; };
 function showAlignStatus() {
   const r = S.alignRes;
-  status($('align-status'), `倍速 ${r.speed.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x，视频开头对应原曲 ${mmss(r.offset)}（${r.offset.toFixed(2)}s），可信度 ${S.alignConf}${S.nudge ? `（微调 ${S.nudge >= 0 ? '+' : ''}${S.nudge.toFixed(2)}s）` : ''}`);
+  status($('align-status'), `倍速 ${r.speed.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x，${r.offset < 0 ? `原曲从视频第 ${(-r.offset / r.speed).toFixed(1)}s 开始` : `视频开头对应原曲 ${mmss(r.offset)}`}（offset ${r.offset.toFixed(2)}s），可信度 ${S.alignConf}${S.nudge ? `（微调 ${S.nudge >= 0 ? '+' : ''}${S.nudge.toFixed(2)}s）` : ''}`);
 }
 function renderCands() {
   const r = S.alignRes, box = $('cands'); box.innerHTML = '';
