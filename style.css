@@ -40,3 +40,34 @@ select,input[type=number]{background:#2c2c2e;color:var(--fg);border:0;border-rad
 .tin{background:#2c2c2e;color:var(--fg);border:0;border-radius:8px;padding:8px;font-size:16px;width:130px}
 .tapsync{margin:10px 0}.tapsync summary{color:var(--pink);padding:6px 0}
 #tap-hit{flex:1;padding:16px}
+/* v1.5 beta 音乐对齐 */
+.plans{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.plans .btn{flex:1;min-width:30%}
+.plans .btn.on{outline:2px solid currentColor}
+.slide-lbl{display:flex;justify-content:space-between;font-size:13px;opacity:.75;margin-top:8px}
+.nudges.two .btn{flex:1;font-size:17px;padding:14px 0;user-select:none;-webkit-user-select:none;touch-action:manipulation}
+.readout-sm{font-size:12px;color:#888;text-align:center;margin:4px 0 10px}
+#align-done{width:100%}
+#align-summary{margin:8px 0}
+details.adv{margin-top:12px}
+details.adv summary{color:#888}
+.ahead{display:flex;align-items:center;gap:8px;margin:4px 0 10px}
+.ahead .sp{flex:1}
+.ghost{background:transparent!important;opacity:.7}
+.offbox{border:1px solid #555;border-radius:8px;padding:6px 12px;font-size:14px}
+.tabs{display:flex;background:#222;border-radius:12px;padding:3px;margin-bottom:10px}
+.tabs .btn{flex:1;background:transparent;border:0;margin:0}
+.tabs .btn.on{background:#2a3a5a;outline:1px solid #5a7ac0}
+.waves{display:flex;gap:6px;align-items:stretch}
+.wl{display:flex;flex-direction:column;justify-content:space-around;font-size:11px;text-align:center;color:#3bb}
+.wl span:last-child{color:#58f}
+#wave{flex:1;width:100%;height:120px;touch-action:none;border-radius:6px;background:#111}
+.nudges.four .btn{flex:1;font-size:14px;padding:12px 0;user-select:none;-webkit-user-select:none;touch-action:manipulation}
+.row.two>.btn{flex:1}
+.stepper{display:flex;justify-content:center;align-items:center;gap:24px;margin:12px 0}
+.stepper .btn{width:56px;height:56px;font-size:24px}
+#sp-val{font-size:28px;min-width:80px;text-align:center}
+.dlg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:flex;align-items:center;justify-content:center}
+.dlg[hidden]{display:none}
+.dlg-box{background:#2a2a2e;border-radius:20px;padding:20px;width:84%;max-width:380px;text-align:center}
+.dlg-box .btn{width:100%;margin-top:10px}

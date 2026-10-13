@@ -53,6 +53,8 @@ export function onsetEnvelope(mono, sr) {
     }
     env[f] = s; const t = prev; prev = cur; cur = t;
   }
+  // v1.5：第 0 帧没有"上一帧"，谱通量是整段频谱 → 巨大假峰，两边都有，会让 0:00 白赢。抹掉开头 3 帧
+  for (let f = 0; f < Math.min(3, frames); f++) env[f] = frames > 3 ? env[3] : 0;
   // 去局部均值（~1s），半波整流，归一化
   const w = 50, out = new Float32Array(frames);
   let acc = 0; const cs = new Float64Array(frames + 1);
@@ -80,7 +82,8 @@ function nccBest(v, r, wantCands = false) {
   const vm = v.reduce((a, b) => a + b, 0) / Nv;
   const ar = new Float64Array(size), ai = new Float64Array(size), br = new Float64Array(size), bi = new Float64Array(size);
   let vn = 0;
-  for (let i = 0; i < Nv; i++) { const z = v[i] - vm; br[i] = z; vn += z * z; }
+  const br0 = new Float64Array(Nv);
+  for (let i = 0; i < Nv; i++) { const z = v[i] - vm; br[i] = z; br0[i] = z; vn += z * z; }
   for (let i = 0; i < Nr; i++) ar[i] = r[i];
   fftInPlace(ar, ai); fftInPlace(br, bi);
   // corr[k] = sum_i r[i+k] v[i]  -> A * conj(B)
@@ -88,20 +91,25 @@ function nccBest(v, r, wantCands = false) {
   fftInPlace(ar, ai); // 共轭技巧做逆变换
   const cs = new Float64Array(Nr + 1), cs2 = new Float64Array(Nr + 1);
   for (let i = 0; i < Nr; i++) { cs[i + 1] = cs[i] + r[i]; cs2[i + 1] = cs2[i] + r[i] * r[i]; }
-  // 任意方向偏移：视频可比原曲早开始，也可从歌中间开始。最少重叠 min(5s, 较短者 60%)
-  // 分数按视频全长归一化 = 整段重叠的总相似度（长上下文），短片段碰巧像不会赢
+  const vs = new Float64Array(Nv + 1), vs2 = new Float64Array(Nv + 1);
+  for (let i = 0; i < Nv; i++) { const z = br0[i]; vs[i + 1] = vs[i] + z; vs2[i + 1] = vs2[i] + z * z; }
+  // v1.5：每个偏移都在"真正重叠的那段"上算皮尔逊相关（两边都按重叠段去均值/方差），
+  // 再乘重叠比例的平方根（重叠越少越不可信），并压低贴边的峰（0:00 或扫描区间两端），避免边缘效应白赢。
   const scores = [];
   let best = -Infinity, bestK = 0;
   const minOv = Math.max(Math.min(ENV_RATE * 5, Math.min(Nv, Nr)), Math.floor(Math.min(Nv, Nr) * 0.6));
-  const kMin = -(Nv - minOv), kMax = Nr - minOv + 1;
+  const kMin = -(Nv - minOv), kMax = Nr - minOv + 1, full = Math.min(Nv, Nr), edge = ENV_RATE * 0.5;
   for (let k = kMin; k < kMax; k++) {
     const a = Math.max(0, k), b = Math.min(Nr, k + Nv);
     if (b - a < minOv) { scores.push(0); continue; }
-    const len = b - a, mean = (cs[b] - cs[a]) / len;
-    const varr = (cs2[b] - cs2[a]) - len * mean * mean;
+    const len = b - a, mr = (cs[b] - cs[a]) / len;
+    const va = a - k, vb = b - k, mv = (vs[vb] - vs[va]) / len;
+    const varr = (cs2[b] - cs2[a]) - len * mr * mr, varv = (vs2[vb] - vs2[va]) - len * mv * mv;
     const idx = ((k % size) + size) % size;
-    const c = ar[idx] / size;
-    const sc = varr > 1e-9 ? c / Math.sqrt(varr * vn) : 0;
+    const c = ar[idx] / size - len * mr * mv;
+    let sc = varr > 1e-9 && varv > 1e-9 ? c / Math.sqrt(varr * varv) : 0;
+    sc *= Math.min(1, len / full);
+    if (Math.abs(k) < edge || k - kMin < edge || kMax - 1 - k < edge) sc *= 0.85;
     scores.push(sc);
     if (sc > best) { best = sc; bestK = k; }
   }
@@ -168,7 +176,7 @@ function withCands(best, refEnv, videoEnv, v0 = 0) {
   const s = best.speed, r = nccBest(videoEnv, stretchEnv(refEnv, s), true);
   const cands = r.cands.map(c => ({ offset: (c.lag - v0) * s / ENV_RATE, score: c.score, rel: c.score / r.score }))
     .sort((a, b) => a.offset - b.offset);
-  const pick = cands.find(c => c.rel >= 0.9) || cands[0];
+  const pick = cands.find(c => c.rel >= 0.97) || cands.slice().sort((a, b) => b.rel - a.rel)[0];
   const out = { ...best, cands, bestOffset: best.offset, z: r.z, ratio: r.ratio, topScore: r.score };
   if (pick) { out.offset = pick.offset; out.score = pick.score; }
   { const a = out.offset + s * v0 / ENV_RATE, b = a + s * videoEnv.length / ENV_RATE;

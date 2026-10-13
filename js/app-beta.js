@@ -1,6 +1,6 @@
 import { Input, BlobSource, ALL_FORMATS, CanvasSink, VideoSampleSink, AudioBufferSink, Output, Mp4OutputFormat, BufferTarget, CanvasSource, AudioBufferSource, canEncodeAudio, canEncodeVideo, QUALITY_HIGH } from '../vendor/mediabunny.min.mjs';
 import { solveTrack, cameraPath } from './track.js';
-import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.4.3';
+import { onsetEnvelope, activeRange, align, renderAligned, toMono } from './audio-beta.js?v=1.5';
 
 const $ = id => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -228,6 +228,7 @@ async function loadOrigAudio() {
   }
   S.origAudio = { sr, ch };
   updateAlignBtn();
+  if (S.ref && !S.alignRes) runAlign();
 }
 
 // ---------- 2. 选人 / 预览 ----------
@@ -388,6 +389,8 @@ function audioWarn() {
 }
 function checkAudio() { setTimeout(() => { if (playing && audioCtx && audioCtx.state !== 'running') audioWarn(); else { const el = document.getElementById('audio-lock'); el && el.remove(); } }, 400); }
 async function startPlay(fromT = null) {
+  if (typeof stopListen === 'function' && listening) stopListen();
+  if (audioNode) { try { audioNode.stop(); } catch { } audioNode = null; }
   const v = $('srcvideo');
   if (S.alignDirty) await renderAlignedAudio();
   if (fromT != null) { fromT = Math.max(0, Math.min(S.dur - 0.5, fromT)); S.cur = sampleAt(fromT + S.t0); }
@@ -396,7 +399,7 @@ async function startPlay(fromT = null) {
   const useRef = S.aligned && S.amode !== 'orig';
   v.muted = !!(useRef && S.amode === 'ref');
   v.volume = S.amode === 'mix' ? 0.4 : 1;
-  playing = true; $('play').textContent = '❚❚ 暂停'; $('aprev').textContent = '❚❚ 停止试听';
+  playing = true; $('play').textContent = '❚❚ 暂停';
   if (useRef) {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state !== 'running') audioCtx.resume().catch(() => { });
@@ -414,7 +417,7 @@ async function startPlay(fromT = null) {
 }
 function stopPlay() {
   if (!playing) return;
-  playing = false; cancelAnimationFrame(rafId); $('play').textContent = '▶︎ 播放'; $('aprev').textContent = '▶︎ 试听对齐点（前 3 秒开始）';
+  playing = false; cancelAnimationFrame(rafId); $('play').textContent = '▶︎ 播放';
   $('srcvideo').pause();
   if (audioNode) { try { audioNode.stop(); } catch { } audioNode = null; }
   draw();
@@ -428,6 +431,7 @@ $('afile').addEventListener('change', async e => {
   try {
     S.ref = await decodeAnyAudio(f); S.refEnv = null; S.alignRes = null; S.aligned = null; $('align-tune').hidden = true;
     $('afile-name').textContent = `✓ ${f.name}（${fmt(S.ref.ch[0].length / S.ref.sr)}）`;
+    if (S.origAudio) runAlign();
   } catch (err) { console.error(err); $('afile-name').innerHTML = `<span class="err">读不了这个文件：${err.message || err}</span>`; S.ref = null; }
   updateAlignBtn();
 });
@@ -450,112 +454,200 @@ async function decodeAnyAudio(f) {
 }
 function updateAlignBtn() { $('align').disabled = !(S.ref && S.origAudio); if (S.ref && !S.origAudio && S.samples.length) $('align-status').innerHTML = '<span class="warn">这个视频没有可用的现场声音，无法自动对齐。</span>'; }
 $('speed').addEventListener('change', () => { $('speed-custom').hidden = $('speed').value !== 'custom'; });
-$('align').addEventListener('click', async () => {
+async function runAlign() {
   const st = $('align-status');
+  if (!(S.ref && S.origAudio)) return;
   try {
-    status(st, '分析节拍…', 0.05); await sleep(30);
+    stopListen();
+    status(st, '正在自动对音乐…（十几秒）', 0.05); await sleep(30);
     if (!S.vidEnv) { const m = toMono(S.origAudio.ch); S.vidEnv = onsetEnvelope(m, S.origAudio.sr); S.vidRange = activeRange(m, S.origAudio.sr); }
     if (!S.refEnv) S.refEnv = onsetEnvelope(toMono(S.ref.ch), S.ref.sr);
     const sv = $('speed').value;
     const speed = sv === 'auto' ? null : sv === 'custom' ? parseFloat($('speed-custom').value) : parseFloat(sv);
-    status(st, speed ? '对齐中…' : '自动识别倍速 + 对齐中…', 0.3); await sleep(30);
+    await sleep(30);
     const r = align(S.vidEnv, S.refEnv, speed, null, S.vidRange);
-    S.alignRes = r; S.autoOffset = r.offset;
+    // 没手动选过速度时，顺便测一下实际速度；明显不是 1x 就提示
+    let det = null;
+    if (!S.speedChosen && speed === 1) { await sleep(10); const ra = align(S.vidEnv, S.refEnv, null, null, S.vidRange); if (Math.abs(ra.speed - 1) >= 0.04 && ra.topScore > r.topScore * 1.15) det = ra.speed; }
+    S.detSpeed = det;
+    // 方案 A/B/C：A = 推荐（自动结果），其余按相似度
+    const others = (r.cands || []).filter(c => Math.abs(c.offset - r.offset) > 0.3).sort((a, b) => b.rel - a.rel).slice(0, 2);
+    S.plans = [r.offset, ...others.map(c => c.offset)];
+    S.alignRes = r; S.autoOffset = r.offset; S.planIdx = 0;
+    S.listenAt = null;
     await renderAlignedAudio();
-    $('align-tune').hidden = false;
+    $('align-tune').hidden = false; $('align-main').hidden = false; $('align-summary').hidden = true; $('speed-page').hidden = true;
     refreshAlignUI();
+    if (det) { $('align-main').hidden = true; $('speed-dlg').hidden = false; status($('align-status'), '先确认拍摄时的音乐速度'); } // 第 1 步：速度
   } catch (err) { console.error(err); status(st, `<span class="err">对齐失败：${err.message || err}</span>`); }
-});
-const mmss = t => { const s = Math.abs(t), m = Math.floor(s / 60); return `${t < 0 ? '-' : ''}${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`; };
+}
+$('align').addEventListener('click', runAlign);
 const refDur = () => S.ref.ch[0].length / S.ref.sr;
 // offset = 视频 0 秒时原曲播到的位置（秒，可为负）。原曲 0 秒出现在视频的 -offset/speed 秒
 const vidTimeOfSong0 = o => -o / S.alignRes.speed;
-const CONF = { high: '<span class="ok">高</span>', mid: '<span class="warn">中（建议点候选听一下）</span>', ambiguous: '<span class="warn">不确定：有几个位置几乎一样像（副歌重复），请逐个试听</span>', low: '<span class="err">低：可能对错了，请试听或用手动/敲拍</span>' };
-function describe(o) {
-  return o <= 0 ? `原曲从视频第 ${(vidTimeOfSong0(o)).toFixed(2)} 秒开始响` : `视频开头＝原曲 ${mmss(o)}（原曲在视频之前就开始了）`;
-}
 function showAlignStatus() {
   const r = S.alignRes, manual = Math.abs(r.offset - S.autoOffset) > 0.005;
-  status($('align-status'), `倍速 ${r.speed.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x · ${describe(r.offset)}<br>${manual ? '当前是<b>手动设置</b>' : `自动结果可信度 ${CONF[r.conf] || CONF.low}`}`);
+  status($('align-status'), manual ? '已手动调整，点「对着听」确认' : r.conf === 'high' ? '<span class="ok">已自动对好</span>，点「对着听」确认一下' : '<span class="warn">没把握，听听对不对</span>');
 }
 function refreshAlignUI() { showAlignStatus(); renderCands(); syncManual(); }
 function renderCands() {
   const r = S.alignRes, box = $('cands'); box.innerHTML = '';
-  const cs = (r.cands || []).slice().sort((a, b) => b.rel - a.rel).slice(0, 5);
-  if (!cs.length) { box.innerHTML = '<span class="hint">没有找到别的像的位置</span>'; return; }
-  cs.forEach((c, i) => {
-    const b = document.createElement('button');
-    b.innerHTML = `<span>${i === 0 ? '★ ' : ''}${describe(c.offset)}</span><span>${Math.round(c.rel * 100)}%</span>`;
-    b.classList.toggle('on', Math.abs(c.offset - r.offset) < 0.05);
-    b.addEventListener('click', async () => { stopPlay(); await setOffset(c.offset); previewAround(); });
+  if (!S.plans) return;
+  S.plans.forEach((o, i) => {
+    const b = document.createElement('button'); b.className = 'btn';
+    b.textContent = i === 0 ? '推荐' : '备选 ' + i;
+    b.classList.toggle('on', i === (S.planIdx || 0));
+    b.addEventListener('click', async () => { S.listenAt = null; S.planIdx = i; await setOffset(o); startListen(); });
     box.appendChild(b);
   });
 }
-// —— 手动设置：两种说法，同一个 offset ——
-S.mmode = 'vid';
-function manualVal() { const o = S.alignRes.offset; return S.mmode === 'vid' ? vidTimeOfSong0(o) : o; }
-function valToOffset(x) { return S.mmode === 'vid' ? -x * S.alignRes.speed : x; }
+// 滑条值 = 音乐推后的秒数（相对推荐位置）；推后 = 原曲在视频里晚响 = offset 变小
 function syncManual() {
   if (!S.alignRes) return;
-  if (!S.mmodeLock) { const want = S.alignRes.offset <= 0 ? 'vid' : 'song'; if (want !== S.mmode) { S.mmode = want; document.querySelectorAll('#mmode button').forEach(x => x.classList.toggle('on', x.dataset.mm === want)); } }
-  S.mmodeLock = false;
-  const sl = $('mslider'), x = manualVal();
-  if (S.mmode === 'vid') { sl.min = 0; sl.max = Math.max(1, S.dur - 1).toFixed(1); }
-  else { sl.min = 0; sl.max = Math.max(1, refDur() - 1).toFixed(1); }
-  sl.value = x.toFixed(2);
-  const out = S.mmode === 'vid' ? (x >= 0 ? `原曲从视频第 ${x.toFixed(2)} 秒响` : '（原曲在视频开始前就响了→切到右边那种说法）')
-    : (x >= 0 ? `视频开头＝原曲 ${mmss(x)}` : '（原曲在视频中途才响→切到左边那种说法）');
-  $('mreadout').textContent = out;
-  $('mhint').textContent = S.mmode === 'vid' ? '适合：视频开头有一段空白/说话，音乐后来才响。' : '适合：录的时候音乐早就在放，视频是从歌中间开始的。';
+  const base = S.plans ? S.plans[S.planIdx || 0] : S.autoOffset;
+  const ms = Math.round((S.alignRes.offset - base) / S.alignRes.speed * 1000); // 正 = 音乐提前 = 动作晚
+  $('mreadout').textContent = `偏移 ${ms} ms`;
+  $('speed-lbl').textContent = Math.abs(S.alignRes.speed - 1) > 0.001 ? S.alignRes.speed.toFixed(2) + 'x' : '';
+  drawWave();
 }
 let renderTimer = 0;
 async function setOffset(o, debounce = false) {
   const r = S.alignRes; if (!r) return;
-  r.offset = +o.toFixed(3); S.alignDirty = true;
-  showAlignStatus(); syncManual();
-  $('cands').querySelectorAll('button').forEach((b, i) => b.classList.remove('on'));
-  renderCands();
+  r.offset = +o.toFixed(3); S.alignDirty = true; S.mixDirty = true;
+  showAlignStatus(); syncManual(); renderCands();
   clearTimeout(renderTimer);
-  if (debounce) { renderTimer = setTimeout(() => renderAlignedAudio(), 250); return; }
+  const wasListening = listening;
+  if (debounce) { renderTimer = setTimeout(async () => { await renderAlignedAudio(); if (wasListening || listening) startListen(); }, 200); return; }
   await renderAlignedAudio();
+  if (wasListening) startListen();
 }
-document.querySelectorAll('#mmode button').forEach(b => b.addEventListener('click', () => {
-  document.querySelectorAll('#mmode button').forEach(x => x.classList.toggle('on', x === b)); S.mmode = b.dataset.mm; S.mmodeLock = true; syncManual();
-}));
-$('mslider').addEventListener('input', () => { stopPlay(); setOffset(valToOffset(parseFloat($('mslider').value)), true); });
-document.querySelectorAll('#align-tune [data-n]').forEach(b => b.addEventListener('click', async () => {
-  if (!S.alignRes) return; stopPlay();
-  // 按钮的含义跟随当前说法：+ = 数字变大
-  await setOffset(valToOffset(manualVal() + parseFloat(b.dataset.n)));
-}));
+const nudge = d => { setOffset(S.alignRes.offset - d * S.alignRes.speed, true); }; // d>0 = 音乐推后 = 动作显得早
+function holdRepeat(el, fn) {
+  let t1 = 0, t2 = 0;
+  const stop = () => { clearTimeout(t1); clearInterval(t2); };
+  el.addEventListener('pointerdown', e => { e.preventDefault(); if (!S.alignRes) return; fn(); t1 = setTimeout(() => { t2 = setInterval(fn, 120); }, 450); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => el.addEventListener(t, stop));
+  el.addEventListener('contextmenu', e => e.preventDefault());
+}
+// 让动作早一点(← 负) = 音乐推后
+document.querySelectorAll('[data-ms]').forEach(b => holdRepeat(b, () => nudge(-parseFloat(b.dataset.ms) / 1000)));
+$('reset-off').addEventListener('click', () => { if (S.alignRes) setOffset(S.plans ? S.plans[S.planIdx || 0] : S.autoOffset, true); });
+// —— 波形：上 配乐（已对齐），下 舞蹈（现场声），窗口 8 秒，围绕试听起点；拖配乐 = 改偏移 ——
+const WIN = 8;
+function peaks(ch, sr, t0, n, w) { const out = new Float32Array(n), step = w * sr / n; for (let i = 0; i < n; i++) { let m = 0; const a = Math.floor((t0 * sr) + i * step), b = a + Math.max(1, Math.floor(step)); for (let k = Math.max(0, a); k < b && k < ch.length; k += 4) { const v = Math.abs(ch[k]); if (v > m) m = v; } out[i] = m; } let mx = 1e-6; for (const v of out) if (v > mx) mx = v; for (let i = 0; i < n; i++) out[i] /= mx; return out; }
+let dragDx = 0;
+function drawWave() {
+  const cv = $('wave'); if (!cv || !S.alignRes || !S.aligned) return;
+  const W = cv.clientWidth || 300, H = 120, dpr = window.devicePixelRatio || 1; cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const t0 = listenStart(), n = Math.floor(W / 3);
+  const A = peaks(S.aligned.ch[0], S.aligned.sr, t0, n, WIN), B = S.origAudio ? peaks(S.origAudio.ch[0], S.origAudio.sr, t0, n, WIN) : null;
+  g.fillStyle = '#1aa39a'; for (let i = 0; i < n; i++) { const h = Math.max(1, A[i] * 25); g.fillRect(i * 3 + dragDx, 30 - h, 2, h * 2); }
+  if (B) { g.fillStyle = '#3b6cf0'; for (let i = 0; i < n; i++) { const h = Math.max(1, B[i] * 25); g.fillRect(i * 3, 90 - h, 2, h * 2); } }
+  g.fillStyle = '#fff'; g.fillRect(0, 0, 2, H);
+  if (listening && audioCtx) { const x = (S.listenPos || 0) / WIN * W; g.fillStyle = 'rgba(255,255,255,.6)'; g.fillRect(x, 0, 1, H); }
+}
+{ const cv = $('wave'); let x0 = null;
+  cv.addEventListener('pointerdown', e => { if (!S.alignRes) return; x0 = e.clientX; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointermove', e => { if (x0 == null) return; dragDx = e.clientX - x0; drawWave(); });
+  const end = e => { if (x0 == null) return; const W = cv.clientWidth || 300, d = dragDx / W * WIN; x0 = null; dragDx = 0; if (Math.abs(d) > 0.005) nudge(d); else drawWave(); };
+  cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end); }
+// —— 速度对齐 ——
+let spVal = 1;
+const spShow = () => { $('sp-val').textContent = spVal.toFixed(2).replace(/0$/, '') + 'x'; };
+function openSpeed() { $('speed-dlg').hidden = true; spVal = S.alignRes ? (S.detSpeed || S.alignRes.speed) : 1; spShow(); stopListen(); $('align-main').hidden = true; $('speed-page').hidden = false; }
+$('speed-open').addEventListener('click', openSpeed);
+$('dlg-go').addEventListener('click', openSpeed);
+$('dlg-stay').addEventListener('click', () => { $('speed-dlg').hidden = true; S.speedChosen = true; $('align-main').hidden = false; showAlignStatus(); });
+$('sp-minus').addEventListener('click', () => { spVal = Math.max(0.5, +(spVal - 0.05).toFixed(2)); spShow(); });
+$('sp-plus').addEventListener('click', () => { spVal = Math.min(1.5, +(spVal + 0.05).toFixed(2)); spShow(); });
+$('speed-close').addEventListener('click', () => { $('speed-page').hidden = true; $('align-main').hidden = false; });
+$('sp-apply').addEventListener('click', async () => {
+  const sel = $('speed'); if (![...sel.options].some(o => o.value === String(spVal))) { sel.value = 'custom'; $('speed-custom').value = spVal; } else sel.value = String(spVal);
+  S.speedChosen = true; $('speed-page').hidden = true; await runAlign();
+});
+$('align-done').addEventListener('click', () => { stopListen(); $('align-main').hidden = true; $('align-summary').hidden = false; $('align-status').innerHTML = ''; });
+$('align-reopen').addEventListener('click', () => { $('align-main').hidden = false; $('align-summary').hidden = true; showAlignStatus(); });
 function parseTime(str) {
-  str = String(str || '').trim().replace(/[，,。]/g, '.').replace(/[：]/g, ':').replace(/[^\d.:\-]/g, '');
+  str = String(str || '').trim().replace(/[，,。]/g, '.').replace(/[：]/g, ':').replace(/[−—–]/g, '-').replace(/[^\d.:\-]/g, '');
   if (!str) return NaN;
-  if (str.includes(':')) { const [m, s] = str.split(':'); return (+m || 0) * 60 + (parseFloat(s) || 0); }
-  return parseFloat(str);
+  const neg = str.startsWith('-'); str = str.replace(/-/g, '');
+  let v; if (str.includes(':')) { const [m, s] = str.split(':'); v = (+m || 0) * 60 + (parseFloat(s) || 0); } else v = parseFloat(str);
+  return neg ? -v : v;
 }
 $('man-off').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('man-apply').click(); } });
 $('man-apply').addEventListener('click', async () => {
   const x = parseTime($('man-off').value);
   if (!S.alignRes) return;
-  if (!isFinite(x)) { $('mhint').textContent = '没看懂这个数字，输入秒数如 15 或 15.5，或 1:05.5'; return; }
-  stopPlay(); $('man-off').blur();
-  await setOffset(valToOffset(x)); previewAround();
+  if (!isFinite(x)) { $('mhint').textContent = '没看懂，输入秒数如 15 或 15.5'; return; }
+  $('man-off').blur(); S.listenAt = null;
+  await setOffset(-x * S.alignRes.speed); startListen();
 });
-// 试听：从对齐点前 3 秒开始播（模式"原曲从视频第X秒响"时对齐点就是 X；否则从当前进度条位置前 3 秒）
-function previewAround() {
-  const r = S.alignRes; if (!r) return;
-  if (S.amode === 'orig') { document.querySelector('#amode [data-m="mix"]').click(); }
-  const x = vidTimeOfSong0(r.offset);
-  const cur = Math.max(0, S.samples[S.cur].t - S.t0);
-  const at = x > 0.5 && x < S.dur - 1 ? x : cur > 3 ? cur : (S.vidRange ? S.vidRange[0] / 100 + 3 : 3);
-  startPlay(Math.max(0, at - 3));
+
+// —— 对着听：唯一的播放路径。现场声+原曲预先混成一个 AudioBuffer（每次改位置重混一次），
+// 视频静音只出画面；用同一个 AudioContext，在手势里同步启动。永远只有一个 source。
+let listening = false, listenSrc = null, listenRaf = 0, mixBuf = null;
+function getCtx() {
+  try { if (navigator.audioSession && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback'; } catch { }
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(() => { });
+  return audioCtx;
 }
-$('aprev').addEventListener('click', () => playing ? stopPlay() : previewAround());
+function buildMix() {
+  const ctx = getCtx(), a = S.aligned, o = S.origAudio; if (!a) return null;
+  const sr = a.sr, n = a.ch[0].length;
+  let peakO = 1e-6; if (o) { const c = o.ch[0]; for (let i = 0; i < c.length; i += 7) { const v = Math.abs(c[i]); if (v > peakO) peakO = v; } }
+  const gO = Math.min(4, 0.7 / peakO);
+  const buf = ctx.createBuffer(2, n, sr);
+  for (let c = 0; c < 2; c++) {
+    const A = a.ch[Math.min(c, a.ch.length - 1)], B = o ? o.ch[Math.min(c, o.ch.length - 1)] : null, out = buf.getChannelData(c);
+    // 戴耳机时：原曲偏左、现场声偏右，更好分辨；外放时就是普通混音
+    const ga = c === 0 ? 0.75 : 0.45, gb = (c === 0 ? 0.45 : 0.75) * gO;
+    for (let i = 0; i < n; i++) { const v = ga * A[i] + (B ? gb * (B[i] || 0) : 0); out[i] = v > 1 ? 1 : v < -1 ? -1 : v; }
+  }
+  mixBuf = buf; S.mixDirty = false; return buf;
+}
+function listenStart() { // 从"音乐和画面都有"的地方开始：原曲开始响的位置前 1 秒，或现场开始有声音的地方
+  if (S.listenAt != null) return S.listenAt;
+  const x = vidTimeOfSong0(S.alignRes.offset), rs = S.vidRange ? S.vidRange[0] / 100 : 0;
+  let t = x > 0 ? x - 1 : rs; t = Math.max(0, Math.min(S.dur - 3, t));
+  S.listenAt = t; return t;
+}
+function stopListen() {
+  listening = false; cancelAnimationFrame(listenRaf);
+  if (listenSrc) { try { listenSrc.onended = null; listenSrc.stop(); } catch { } try { listenSrc.disconnect(); } catch { } listenSrc = null; }
+  const v = $('srcvideo'); if (!playing) v.pause();
+  $('listen').textContent = '▶︎ 对着听'; drawWave();
+}
+function startListen() {
+  if (!S.alignRes) return;
+  stopPlay(); stopListen(); tapStop();
+  if (listenSrc) { try { listenSrc.onended = null; listenSrc.stop(); } catch { } listenSrc = null; }
+  cancelAnimationFrame(listenRaf);
+  const ctx = getCtx(); // 同步，在手势内
+  if (S.alignDirty) { const r = S.alignRes; S.aligned = { sr: S.origAudio ? S.origAudio.sr : 44100, ch: renderAligned(S.ref.ch, S.ref.sr, r.offset, r.speed, S.dur, S.origAudio ? S.origAudio.sr : 44100) }; S.alignDirty = false; S.mixDirty = true; }
+  const buf = (!mixBuf || S.mixDirty) ? buildMix() : mixBuf; if (!buf) return;
+  const t = listenStart();
+  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
+  src.start(0, t); listenSrc = src; listening = true;
+  const ctx0 = ctx.currentTime;
+  src.onended = () => { if (listenSrc === src) stopListen(); };
+  const v = $('srcvideo'); v.muted = true; v.currentTime = t; v.play().catch(() => { });
+  $('listen').textContent = '❚❚ 停';
+  const loop = () => { if (!listening) return; const now = t + ctx.currentTime - ctx0; S.listenPos = now - t; if (S.listenPos <= WIN) drawWave();
+    if (Math.abs(v.currentTime - now) > 0.25 && !v.seeking) v.currentTime = now; // 画面跟着声音走
+    S.cur = sampleAt(v.currentTime + S.t0); draw(v); listenRaf = requestAnimationFrame(loop); };
+  loop();
+  checkAudio2();
+}
+function checkAudio2() { setTimeout(() => { if (listening && audioCtx && audioCtx.state !== 'running') audioWarn(); else { const el = document.getElementById('audio-lock'); el && el.remove(); } }, 400); }
+$('listen').addEventListener('click', () => listening ? stopListen() : startListen());
+
 async function renderAlignedAudio() {
   const r = S.alignRes; if (!r) return; const outSr = S.origAudio ? S.origAudio.sr : 44100;
   const ch = renderAligned(S.ref.ch, S.ref.sr, r.offset, r.speed, S.dur, outSr);
-  S.aligned = { sr: outSr, ch }; S.alignDirty = false;
+  S.aligned = { sr: outSr, ch }; S.alignDirty = false; S.mixDirty = true;
+  if (audioCtx) buildMix(); // 预混好，下一次点按钮立即出声
 }
 document.querySelectorAll('#amode button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('#amode button').forEach(x => x.classList.toggle('on', x === b)); S.amode = b.dataset.m; stopPlay();
@@ -565,12 +657,12 @@ const TAP = { mode: null, v: null, s: null, node: null, ctx0: 0, s0: 0 };
 function tapStop() { if (TAP.node) { try { TAP.node.stop(); } catch { } TAP.node = null; } if (TAP.mode === 'v') { $('srcvideo').pause(); } TAP.mode = null; }
 function tapShow() { $('tap-status').innerHTML = `视频那一拍：${TAP.v == null ? '—' : TAP.v.toFixed(2) + 's'} · 原曲那一拍：${TAP.s == null ? '—' : TAP.s.toFixed(2) + 's'}`; }
 $('tap-v').addEventListener('click', async () => {
-  stopPlay(); tapStop(); const v = $('srcvideo');
+  stopPlay(); stopListen(); tapStop(); const v = $('srcvideo');
   v.muted = false; v.volume = 1; v.currentTime = Math.max(0, S.samples[S.cur].t - S.t0);
   await v.play().catch(() => { }); TAP.mode = 'v'; $('tap-status').textContent = '视频播放中，听到第一下重拍就点「这一拍！」';
 });
 $('tap-s').addEventListener('click', async () => {
-  stopPlay(); tapStop();
+  stopPlay(); stopListen(); tapStop();
   unlockAudio();
   const s0 = Math.max(0, parseTime($('tap-s0').value) || 0);
   const buf = audioCtx.createBuffer(S.ref.ch.length, S.ref.ch[0].length, S.ref.sr); S.ref.ch.forEach((c, k) => buf.copyToChannel(c, k));
@@ -584,8 +676,8 @@ $('tap-hit').addEventListener('click', async () => {
   else { $('tap-status').textContent = '先点 ① 或 ② 开始播放'; return; }
   tapShow();
   if (TAP.v != null && TAP.s != null && S.alignRes) {
-    await setOffset(TAP.s - S.alignRes.speed * TAP.v);
-    $('tap-status').innerHTML += '<br>已按敲拍对齐，点上面「试听」检查，再用 ±0.05 微调。';
+    S.listenAt = null; await setOffset(TAP.s - S.alignRes.speed * TAP.v);
+    $('tap-status').innerHTML += '<br>已按敲拍对齐，点「对着听」检查，再用早一点/晚一点微调。';
   }
 });
 
