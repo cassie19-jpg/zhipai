@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon-180.png">
-<link rel="stylesheet" href="style.css?v=1.5">
+<link rel="stylesheet" href="style.css?v=1.5.1">
 <title>直拍</title>
 </head>
 <body>
@@ -127,7 +127,7 @@
     </div>
   </section>
   <video id="srcvideo" playsinline muted preload="auto" style="position:fixed;left:-10px;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <p class="foot">v1.5 测试版（音乐对齐简化） · <span id="caps"></span></p>
+  <p class="foot">v1.5.1 测试版（修复低电量解码出错） · <span id="caps"></span></p>
 </main>
 <script>
 function showBootErr(msg){var el=document.getElementById('import-status');if(el&&!window.__appReady)el.innerHTML='<span class="err">加载失败：'+msg+'</span><br><button class="btn" onclick="location.reload()">重新加载</button>';}
@@ -136,6 +136,6 @@ window.addEventListener('unhandledrejection',function(e){if(!window.__appReady)s
 document.getElementById('file').addEventListener('change',function(){if(!window.__appReady)showBootErr('程序还没加载完，请稍等几秒或点重新加载');});
 setTimeout(function(){if(!window.__appReady)showBootErr('程序 25 秒还没加载出来（网络慢或缓存问题）');},25000);
 </script>
-<script type="module" src="js/app-beta.js?v=1.5" onerror="showBootErr('js/app-beta.js 下载失败')"></script>
+<script type="module" src="js/app-beta.js?v=1.5.1" onerror="showBootErr('js/app-beta.js 下载失败')"></script>
 </body>
 </html>

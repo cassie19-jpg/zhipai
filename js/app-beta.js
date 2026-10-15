@@ -151,8 +151,18 @@ function iouB(a, b) { const ix = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0
 $('file').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
   e.target.value = '';
-  try { await importVideo(f); } catch (err) { console.error(err); status($('import-status'), `<span class="err">出错了：${err.message || err}</span>`); }
+  try { await importVideo(f); } catch (err) { console.error(err); status($('import-status'), friendlyErr(err)); }
 });
+
+function isCodecStateErr(err) {
+  const m = String((err && (err.name + ' ' + err.message)) || err);
+  return /InvalidState|invalid state|closed codec|reclaim|QuotaExceeded|EncodingError/i.test(m);
+}
+function friendlyErr(err) {
+  const raw = (err && err.message) || String(err);
+  if (isCodecStateErr(err)) return `<span class="err">出错了：手机暂时没法解码这个视频（系统把视频解码器收回了）。</span>\n通常是低电量模式、电量很低或后台 App 太多导致的。请：① 充上电 / 关掉低电量模式；② 关掉几个后台 App；③ 刷新本页面后重新选视频。\n<span class="hint">原始信息：${raw}</span>`;
+  return `<span class="err">出错了：${raw}</span>\n可以刷新页面再试一次。`;
+}
 
 async function importVideo(file) {
   resetAll();
@@ -179,19 +189,34 @@ async function importVideo(file) {
   const scale = 512 / Math.max(S.W, S.H);
   const cw = Math.round(S.W * scale), ch = Math.round(S.H * scale);
   S.thumbW = cw; S.thumbH = ch;
-  const sink = new CanvasSink(vt, { width: cw, height: ch, fit: 'fill', poolSize: 2 });
   const tStart = performance.now();
-  let i = 0;
-  for await (const wc of sink.canvasesAtTimestamps(times)) {
-    if (!wc) { i++; continue; }
-    const c = wc.canvas, ctx = c.getContext('2d', { willReadFrequently: true });
-    const img = ctx.getImageData(0, 0, cw, ch).data;
-    const dets = detectFrame(lmk, c, cw, ch, img);
-    S.samples.push({ t: wc.timestamp, dets });
-    S.thumbs.push(await new Promise(r => c.toBlob(r, 'image/jpeg', 0.7))); // 存成 JPEG，省内存
-    i++;
-    const el = (performance.now() - tStart) / 1000;
-    status(st, `识别画面里的人… ${i}/${times.length}（已用 ${el.toFixed(0)} 秒${i > 5 ? `，预计还要 ${Math.max(1, Math.round(el / i * (times.length - i)))} 秒` : ''}）\n处理时请保持本页面在前台、不要锁屏`, i / times.length);
+  // v1.5.1：iOS 在低电量 / 内存紧张时会回收硬件解码器，之后再用就报 InvalidStateError。
+  // 出错时用全新的 Input / 解码器从断点继续，最多重试 2 次。
+  let i = 0, retries = 0, curVt = vt;
+  while (i < times.length) {
+    try {
+      const sink = new CanvasSink(curVt, { width: cw, height: ch, fit: 'fill', poolSize: 2 });
+      for await (const wc of sink.canvasesAtTimestamps(times.slice(i))) {
+        if (!wc) { i++; continue; }
+        const c = wc.canvas, ctx = c.getContext('2d', { willReadFrequently: true });
+        const img = ctx.getImageData(0, 0, cw, ch).data;
+        const dets = detectFrame(lmk, c, cw, ch, img);
+        S.samples.push({ t: wc.timestamp, dets });
+        S.thumbs.push(await new Promise(r => c.toBlob(r, 'image/jpeg', 0.7))); // 存成 JPEG，省内存
+        i++;
+        const el = (performance.now() - tStart) / 1000;
+        status(st, `识别画面里的人… ${i}/${times.length}（已用 ${el.toFixed(0)} 秒${i > 5 ? `，预计还要 ${Math.max(1, Math.round(el / i * (times.length - i)))} 秒` : ''}）\n处理时请保持本页面在前台、不要锁屏`, i / times.length);
+      }
+      break;
+    } catch (err) {
+      if (!isCodecStateErr(err) || retries >= 2) throw err;
+      retries++; console.warn('解码器失效，重建后从第', i, '帧继续', err);
+      status(st, `解码器被系统中断，正在重新连接…（第 ${retries} 次）`, i / times.length);
+      await new Promise(r => setTimeout(r, 400));
+      const inp = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+      curVt = await inp.getPrimaryVideoTrack();
+      S.input = inp; S.vt = curVt; S.at = await inp.getPrimaryAudioTrack();
+    }
   }
   const people = S.samples.reduce((m, s) => Math.max(m, s.dets.length), 0);
   status(st, `<span class="ok">分析完成</span>：${fmt(S.dur)}，${S.W}×${S.H}，最多识别到 ${people} 人，用时 ${((performance.now() - tStart) / 1000).toFixed(0)} 秒。`);
@@ -728,7 +753,7 @@ $('export').addEventListener('click', async () => {
     $('outvideo').src = url; $('download').href = url;
     $('result').hidden = false;
     status(st, `<span class="ok">完成</span>：${(blob.size / 1048576).toFixed(1)} MB${note}${aCodec === 'opus' ? '（音频为 Opus 编码，个别播放器可能不兼容）' : ''}`);
-  } catch (err) { console.error(err); status(st, `<span class="err">导出失败：${err.message || err}</span>`); }
+  } catch (err) { console.error(err); status(st, friendlyErr(err).replace("出错了", "导出失败")); }
   $('export').disabled = false;
 });
 
